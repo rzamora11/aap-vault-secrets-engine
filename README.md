@@ -24,9 +24,8 @@ each credential request instead of distributing a shared long-lived token.
 - [API reference](#api-reference)
 - [Terraform Actions direction](#terraform-actions-direction)
 - [Security and operations](#security-and-operations)
-- [Testing and development](#testing-and-development)
 - [Roadmap](#roadmap)
-- [Contributing](#contributing)
+- [License](#license)
 
 ## How it works
 
@@ -233,38 +232,6 @@ state and is therefore test-only.
 - Run the plugin binary and configure its checksum according to Vault's
   [external plugin documentation](https://developer.hashicorp.com/vault/docs/plugins).
 
-Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
-
-## Testing and development
-
-```sh
-make fmt
-make test
-make vet
-make build
-```
-
-### Automated unit tests
-
-Unit tests use an in-memory Vault backend and a fake AAP gateway. They cover
-issuer authentication, configuration redaction, lease lifetime capping, and
-idempotent remote revocation. They run in CI without requiring credentials or
-network access to a real AAP environment.
-
-### Live end-to-end validation
-
-The MVP was also validated against a real AAP 2.7 deployment with Automation
-Controller 4.8.0:
-
-1. Vault issued a leased AAP child token from the configured issuer token.
-2. The child token called the Automation Controller API successfully.
-3. Vault revoked the lease.
-4. AAP rejected the child token with HTTP `401` after revocation.
-
-The live test confirms the complete AAP token lifecycle. It is separate from
-the automated unit suite because it requires an AAP environment and a protected
-issuer token.
-
 ## Roadmap
 
 - Additional AAP version and deployment validation.
@@ -274,12 +241,6 @@ issuer token.
 - A production-safe Terraform delivery pattern that avoids credential material
   entering Terraform state.
 
-## Contributing
-
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before
-opening a pull request.
-
 ## License
 
-The project does not have a license selected yet. Choose and add one before
-asking others to use, modify, or redistribute the code.
+This project is licensed under the [Mozilla Public License 2.0](LICENSE).
