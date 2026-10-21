@@ -1,109 +1,285 @@
-# Vault secrets engine for Ansible Automation Platform
+# AAP Vault secrets engine
 
-`vault-plugin-secrets-aap` is an external HashiCorp Vault logical secrets
-engine. It creates a new AAP platform-gateway OAuth token whenever a caller
-reads a Vault `creds` endpoint, and revokes that token when the Vault lease is
-revoked or expires.
+[![CI](https://github.com/rzamora11/aap-vault-secrets-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/rzamora11/aap-vault-secrets-engine/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/roman-zamora/aap-vault-secrets-engine.svg)](https://pkg.go.dev/github.com/roman-zamora/aap-vault-secrets-engine)
 
-The MVP targets AAP 2.7 and newer platform-gateway deployments. It uses an AAP
-**issuer token** as the provisioning identity: Vault uses that bearer token to
-create a distinct child token for every credential request, then deletes the
-child token when its Vault lease ends.
+`vault-plugin-secrets-aap` is a community Vault secret plugin that issues and
+revokes short-lived OAuth tokens for Red Hat Ansible Automation Platform (AAP).
+It gives Terraform, CI systems, and other Vault clients a fresh AAP token for
+each credential request instead of distributing a shared long-lived token.
 
-## Security model
+> [!WARNING]
+> This is an MVP and a community project. It is not developed, supported, or
+> endorsed by HashiCorp or Red Hat. Test it outside production before relying
+> on it. The engine has been tested against AAP 2.7 (Automation Controller
+> 4.8.0) and Vault 1.18.4. Compatibility with other releases needs validation.
 
-The identity that owns the configured issuer token determines the generated
-token's AAP RBAC. A Vault role cannot add AAP permissions; it selects only the
-token scope (`read` or `write`) and the Vault lease lifetime. Create a
-narrowly-permitted local service identity and issuer token per AAP environment
-or tenant boundary. Never use an AAP administrator token.
+## Contents
 
-The issuer token and CA certificate are held in Vault's seal-wrapped plugin
-storage and are intentionally omitted from configuration reads. The plugin
-verifies TLS by default. Set `tls_skip_verify=true` only for a non-production
-test environment. Plaintext HTTP is rejected unless `allow_insecure_http=true`
-is explicitly set for a test environment.
+- [How it works](#how-it-works)
+- [What the MVP supports](#what-the-mvp-supports)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Access policy](#access-policy)
+- [API reference](#api-reference)
+- [Terraform Actions direction](#terraform-actions-direction)
+- [Security and operations](#security-and-operations)
+- [Testing and development](#testing-and-development)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
 
-AAP controls the actual OAuth expiry system-wide. The plugin does not require
-that setting to change: it calculates the lease as the smallest of the role
-TTL, role maximum TTL, and the AAP-reported remaining lifetime less a one-minute
-safety margin. If Vault cannot revoke a child token, the AAP expiry is the
-fallback limit. The issuer token has its own lifecycle and must be rotated
-before its AAP expiry; if it expires, Vault cannot issue or revoke child tokens.
+## How it works
 
-Generated leases are deliberately non-renewable. Requesting a fresh secret
-creates a fresh AAP token rather than extending an opaque upstream credential.
+```text
+Vault client
+  -> read aap/creds/<role>
+  -> Vault plugin uses a protected AAP issuer token
+  -> AAP gateway creates a unique child token
+  -> Vault returns the child token with a non-renewable lease
+  -> Vault revokes the child token when the lease ends or is revoked
+```
 
-## API
+The plugin uses AAP's platform-gateway token endpoint. The configured issuer
+token is the provisioning identity. Vault keeps it in seal-wrapped plugin
+storage and uses it only to create and revoke child tokens.
 
-| Path | Operations | Purpose |
-| --- | --- | --- |
-| `config` | read, write, delete | AAP platform gateway and protected issuer token |
-| `roles/<name>` | read, write, delete | Token scope and Vault TTL policy |
-| `roles` | list | List configured roles |
-| `creds/<name>` | read | Create a leased OAuth token |
+## What the MVP supports
 
-The `creds` response contains `token`, `host`, and `expires_at`. Consumers use
-the token as `AAP_TOKEN` and the host as `AAP_HOST` with the `ansible/aap`
-Terraform provider.
+- AAP 2.7 platform-gateway token creation and revocation.
+- One unique AAP bearer token per `creds` read.
+- Vault leases that are non-renewable and default to one hour.
+- AAP `read` and `write` token scopes.
+- Lease revocation that deletes the issued token in AAP.
+- TLS verification by default, optional custom CA, and explicit opt-in for
+  insecure HTTP or skipped certificate verification.
 
-## Build
+The effective Vault lease is the shortest of the role TTL, the role maximum
+TTL, and the AAP token's remaining lifetime minus one minute. The engine does
+not require a change to AAP's global token lifetime.
 
-The project requires Go 1.23 or later and a Vault version compatible with the
-plugin SDK declared in `go.mod`.
+## Requirements
+
+- A self-managed Vault deployment that can register and execute external
+  plugins. Vault treats this as an external `secret` plugin.
+- Go 1.23.3 or later to build from source.
+- An AAP instance that exposes the platform gateway token endpoint.
+- A dedicated AAP service identity with permission to create and delete its
+  own child tokens.
+
+The engine needs network access from every Vault node to the AAP gateway.
+
+## Quick start
+
+### 1. Build the plugin
 
 ```sh
-make test
+git clone https://github.com/rzamora11/aap-vault-secrets-engine.git
+cd aap-vault-secrets-engine
 make build
 ```
 
-This creates `bin/vault-plugin-secrets-aap`.
+The binary is written to `bin/vault-plugin-secrets-aap`.
 
-## Local Vault registration
+### 2. Register and enable it
 
-Place the plugin binary in the `plugin_directory` configured on every Vault
-node. Register its SHA-256, then enable it as an external secret plugin:
+Copy the binary to the `plugin_directory` configured on every Vault node. Then
+register its checksum and enable it at the `aap/` mount path:
 
 ```sh
 SHA256=$(shasum -a 256 bin/vault-plugin-secrets-aap | cut -d ' ' -f1)
-vault plugin register -sha256="$SHA256" -command=vault-plugin-secrets-aap secret vault-plugin-secrets-aap
-vault secrets enable -path=aap -plugin-name=vault-plugin-secrets-aap plugin
+
+vault plugin register \
+  -sha256="$SHA256" \
+  -command=vault-plugin-secrets-aap \
+  secret vault-plugin-secrets-aap
+
+vault secrets enable \
+  -path=aap \
+  -plugin-name=vault-plugin-secrets-aap \
+  plugin
 ```
 
-## Configure and issue a token
+For a local development server, start Vault with `-dev-plugin-dir=./bin` after
+building the binary.
+
+### 3. Configure the AAP connection
+
+Create a dedicated AAP service identity and issuer token before this step. Do
+not configure an AAP administrator token.
 
 ```sh
 vault write aap/config \
   url=https://aap.example.com \
-  issuer_token='replace-me'
+  issuer_token='replace-with-aap-issuer-token'
+```
 
+The plugin does not return `issuer_token` or `ca_cert` from `aap/config`.
+
+### 4. Create an issuing role
+
+```sh
 vault write aap/roles/terraform-operator \
   scope=write \
   ttl=1h \
   max_ttl=1h \
   description_prefix=vault-aap-terraform
+```
 
+`write` includes read access in AAP. Use `read` when a client only needs to
+inspect AAP objects.
+
+### 5. Request and revoke credentials
+
+```sh
 vault read aap/creds/terraform-operator
 ```
 
-The default role TTL is one hour; `ttl` and `max_ttl` accept Vault duration
-syntax. The effective lease can be shorter if AAP returns an earlier expiry.
+The response contains `token`, `host`, and `expires_at`, plus a Vault lease ID.
+To revoke the AAP child token before the lease ends:
 
-## Terraform delivery
+```sh
+vault lease revoke aap/creds/terraform-operator/<lease-id>
+```
 
-Keep the engine runtime-neutral: acquire a lease immediately before the
-Terraform run and inject its `token` into `AAP_TOKEN`. Do not persist the
-generated response in Terraform state. For an HCP Terraform proof of concept,
-using a Vault data source can demonstrate the integration, but it may persist
-the token in state and is not the recommended production delivery method.
+Use the lease ID returned by the `vault read` command. Vault also attempts the
+same revocation when the lease expires.
 
-## Tests
+## Access policy
 
-Unit tests use an in-memory Vault backend and a fake AAP gateway. They cover:
+Give workloads permission only to read the specific credential role they need:
 
-- token creation and revocation with an AAP issuer bearer token;
-- AAP expiry capping a one-hour Vault lease;
-- configuration redaction;
-- remote token revocation, including idempotent handling of AAP `404`.
+```hcl
+path "aap/creds/terraform-operator" {
+  capabilities = ["read"]
+}
+```
 
-An acceptance test against a real AAP 2.7 environment remains the next step.
+Keep configuration and role management in a separate administrator policy. A
+role controls only scope and lease duration. AAP RBAC comes from the service
+identity that owns the configured issuer token, so use a separate issuer token
+for each meaningful tenant or environment boundary.
+
+## API reference
+
+### `aap/config`
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `url` | Yes | AAP platform gateway base URL. HTTPS is required by default. |
+| `issuer_token` | Yes | AAP bearer token used to issue and revoke child tokens. |
+| `tls_skip_verify` | No | Skip TLS certificate validation. Defaults to `false`. Test use only. |
+| `ca_cert` | No | PEM-encoded CA certificate for the AAP gateway. |
+| `allow_insecure_http` | No | Permit an HTTP URL. Defaults to `false`. Test use only. |
+
+Reading the path returns connection metadata and booleans that indicate whether
+sensitive values are configured. It never returns the issuer token or CA
+certificate.
+
+### `aap/roles/<name>`
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `scope` | `write` | AAP OAuth scope: `read` or `write`. |
+| `ttl` | `1h` | Requested lifetime for generated credentials. |
+| `max_ttl` | `24h` | Maximum lifetime for generated credentials. |
+| `description_prefix` | `vault-aap` | Prefix used to identify Vault-issued tokens in AAP. |
+
+`ttl` must be positive and cannot exceed `max_ttl`.
+
+### `aap/creds/<name>`
+
+Reads the named role, creates a child AAP token, and returns a non-renewable
+Vault lease. The response data contains:
+
+| Field | Description |
+| --- | --- |
+| `token` | The generated AAP bearer token. |
+| `host` | The configured AAP base URL. |
+| `expires_at` | AAP-reported expiry in RFC 3339 format. |
+
+Revoking the Vault lease deletes the child token through the AAP gateway. AAP's
+own token expiry remains the final fallback if AAP is unavailable during Vault
+revocation.
+
+## Terraform Actions direction
+
+This MVP was built to validate the AAP credential lifecycle required by a
+potential native dynamic credentials broker for Terraform Actions in the
+[`ansible/aap`](https://registry.terraform.io/providers/ansible/aap/latest/docs)
+provider on HCP Terraform.
+
+The engine proves that a broker can issue a unique AAP token for a Terraform
+operation and revoke it when the Vault lease ends. It is not a native HCP
+Terraform dynamic credentials integration today. HCP Terraform does not
+currently inject credentials from an arbitrary custom Vault secret engine into
+the AAP provider.
+
+For any non-native integration, acquire a credential immediately before the
+Terraform operation and pass the returned token as `AAP_TOKEN`. Do not put the
+generated token in Terraform configuration, plan files, or state. A Vault data
+source can demonstrate the flow, but it can persist the token in Terraform
+state and is therefore test-only.
+
+## Security and operations
+
+- The issuer token is the most sensitive dependency. It should belong to a
+  minimally privileged, non-administrator AAP service identity.
+- Rotate the issuer token before its AAP expiry. If it expires, the engine
+  cannot issue or revoke child tokens.
+- Use a separate issuer identity per environment or tenant boundary. This is
+  how you keep AAP permissions separate in the current MVP.
+- Vault uses normal TLS validation unless an operator explicitly disables it.
+- Audit both Vault lease events and AAP token activity.
+- Run the plugin binary and configure its checksum according to Vault's
+  [external plugin documentation](https://developer.hashicorp.com/vault/docs/plugins).
+
+Report vulnerabilities through the process in [SECURITY.md](SECURITY.md).
+
+## Testing and development
+
+```sh
+make fmt
+make test
+make vet
+make build
+```
+
+### Automated unit tests
+
+Unit tests use an in-memory Vault backend and a fake AAP gateway. They cover
+issuer authentication, configuration redaction, lease lifetime capping, and
+idempotent remote revocation. They run in CI without requiring credentials or
+network access to a real AAP environment.
+
+### Live end-to-end validation
+
+The MVP was also validated against a real AAP 2.7 deployment with Automation
+Controller 4.8.0:
+
+1. Vault issued a leased AAP child token from the configured issuer token.
+2. The child token called the Automation Controller API successfully.
+3. Vault revoked the lease.
+4. AAP rejected the child token with HTTP `401` after revocation.
+
+The live test confirms the complete AAP token lifecycle. It is separate from
+the automated unit suite because it requires an AAP environment and a protected
+issuer token.
+
+## Roadmap
+
+- Additional AAP version and deployment validation.
+- Per-role issuer identities and AAP RBAC validation.
+- Metrics and operational guidance.
+- Release automation, signed artifacts, and compatibility testing.
+- A production-safe Terraform delivery pattern that avoids credential material
+  entering Terraform state.
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before
+opening a pull request.
+
+## License
+
+The project does not have a license selected yet. Choose and add one before
+asking others to use, modify, or redistribute the code.
