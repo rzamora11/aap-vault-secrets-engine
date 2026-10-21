@@ -12,7 +12,7 @@ each credential request instead of distributing a shared long-lived token.
 > This is an MVP and a community project. It is not developed, supported, or
 > endorsed by HashiCorp or Red Hat. Test it outside production before relying
 > on it. The engine has been tested against AAP 2.7 (Automation Controller
-> 4.8.0) and Vault 1.18.4. Compatibility with other releases needs validation.
+> 4.8.0) and Vault Self-Managed. Compatibility with other releases needs validation.
 
 ## Contents
 
