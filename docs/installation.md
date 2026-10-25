@@ -52,7 +52,7 @@ The plugin stores one AAP connection configuration per mount. A mount supports o
 
 ## Future release archives
 
-Published artifacts do not exist yet. Once a canonical-repository tag in the form `vX.Y.Z` is published, download its archive and `checksums.txt`. Authenticate the checksum manifest before extracting or executing an archive. For tag `v1.2.3`, the Linux amd64 archive name is `vault-plugin-secrets-aap_1.2.3_linux_amd64.tar.gz`.
+Published artifacts do not exist yet. Once a canonical-repository tag in the form `vX.Y.Z` is published, download its archive and `checksums.txt`. Authenticate the downloaded archive before extracting or executing it. For tag `v1.2.3`, the Linux amd64 archive name is `vault-plugin-secrets-aap_1.2.3_linux_amd64.tar.gz`.
 
 ```sh
 set -euo pipefail
@@ -65,7 +65,7 @@ gh release download "$TAG" --repo "$REPOSITORY" \
   --pattern checksums.txt \
   --pattern "$ARCHIVE"
 
-gh attestation verify checksums.txt \
+gh attestation verify "$ARCHIVE" \
   --repo "$REPOSITORY" \
   --source-ref "refs/tags/$TAG" \
   --signer-workflow "rzamora11/aap-vault-secrets-engine/.github/workflows/ci.yml"
@@ -78,6 +78,6 @@ tar -xzf "$ARCHIVE" vault-plugin-secrets-aap
 
 After extracting, follow [Install and register the plugin](#install-and-register-the-plugin): copy this verified `vault-plugin-secrets-aap` file to every Vault server, install it in each configured plugin directory, compare the installed-file checksums, and register once with `PLUGIN_VERSION="${TAG#v}"`. Do not use the archive checksum or the extracted-file checksum as the registration checksum. The registration checksum comes from the identical installed files on the Vault servers.
 
-The attested `checksums.txt` authenticates the archive hash. The archive hash verifies the downloaded archive before extraction. The extracted file is the verified input to each server installation. Vault registration requires the checksum of the installed plugin binary after that copy. These are distinct hashes. The attestation command binds the manifest to the canonical repository, expected tag ref, and release workflow.
+The attestation authenticates the downloaded archive. `checksums.txt` is a supplemental archive-hash check. The extracted file is the verified input to each server installation. Vault registration requires the checksum of the installed plugin binary after that copy. These are distinct hashes. The attestation command binds the archive to the canonical repository, expected tag ref, and release workflow.
 
 Choose the archive matching the host architecture. The release configuration targets Linux `amd64` and `arm64` only. Do not claim a package for another operating system unless a published release contains it.
