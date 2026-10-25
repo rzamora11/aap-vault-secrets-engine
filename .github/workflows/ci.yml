@@ -5,26 +5,119 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Test and build
+  quality:
+    name: Quality checks
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Check formatting
-        run: test -z "$(gofmt -l ./cmd ./aap)"
-      - name: Run tests
-        run: go test ./...
-      - name: Run vet
-        run: go vet ./...
+      - name: Verify module dependencies
+        run: make mod-verify tidy-check
+      - name: Check formatting, test, race, and vet
+        run: make fmt-check unit race vet
       - name: Build plugin
-        run: go build -o bin/vault-plugin-secrets-aap ./cmd/vault-plugin-secrets-aap
+        run: make build
+      - name: Check known vulnerabilities
+        run: make vulncheck
+
+  integration:
+    name: vault_lifecycle integration (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Download and verify Vault 2.2.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(dpkg --print-architecture)" in
+            amd64) vault_arch=amd64 ;;
+            arm64) vault_arch=arm64 ;;
+            *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;;
+          esac
+          archive="vault_2.2.1_linux_${vault_arch}.zip"
+          base_url="https://releases.hashicorp.com/vault/2.2.1"
+          mkdir -p "$RUNNER_TEMP/vault"
+          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/vault/$archive" "$base_url/$archive"
+          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/vault/vault_2.2.1_SHA256SUMS" "$base_url/vault_2.2.1_SHA256SUMS"
+          (cd "$RUNNER_TEMP/vault" && grep " $archive$" vault_2.2.1_SHA256SUMS | sha256sum --check --status -)
+          unzip -q "$RUNNER_TEMP/vault/$archive" -d "$RUNNER_TEMP/vault/bin"
+      - name: Run real Vault lifecycle integration
+        env:
+          VAULT_BINARY: ${{ runner.temp }}/vault/bin/vault
+        run: make integration
+
+  release-snapshot:
+    if: github.ref_type != 'tag'
+    name: GoReleaser snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build release archives without publishing
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.19.0
+          args: release --snapshot --clean
+
+  release:
+    if: github.event_name == 'push' && github.repository == 'rzamora11/aap-vault-secrets-engine' && startsWith(github.ref, 'refs/tags/v')
+    name: Publish tagged release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Verify vX.Y.Z release tag
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Publish release archives
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.19.0
+          args: release --clean
+      - name: Attest release checksums
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt
