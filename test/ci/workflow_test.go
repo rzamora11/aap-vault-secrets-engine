@@ -5,6 +5,7 @@
  * @behavior
  *   - A tagged release waits for successful quality and integration jobs.
  *   - Vault checksum verification authenticates the signed manifest with HashiCorp's pinned signing identity before extracting an archive.
+ *   - A successful signature from an unexpected signing subkey stops before the archive is downloaded.
  * @edge-cases
  *   - Missing release dependencies, signature verification, or a valid signing subkey fail the workflow contract.
  * @see ../../.github/workflows/ci.yml
@@ -186,7 +187,10 @@ func hasExactNeeds(value interface{}, expected ...string) bool {
 
 func TestVaultInstallerStopsBeforeChecksumAndExtractionWhenVerifyFails(t *testing.T) {
 	workflow := loadWorkflow(t)
-	log := runInstallerWithGPG(t, workflow, trustedPrimaryKey, true)
+	log, succeeded := runInstallerWithGPG(t, workflow, trustedPrimaryKey, trustedSigningKey, 1)
+	if succeeded {
+		t.Fatal("installer unexpectedly succeeded after signature verification failed")
+	}
 	if !strings.Contains(log, "gpg-import") || !strings.Contains(log, "gpg-list") {
 		t.Fatalf("key import and primary-key selection did not succeed before verification: %s", log)
 	}
@@ -198,7 +202,10 @@ func TestVaultInstallerStopsBeforeChecksumAndExtractionWhenVerifyFails(t *testin
 
 func TestVaultInstallerStopsBeforeVerifyWhenImportedPrimaryKeyIsWrong(t *testing.T) {
 	workflow := loadWorkflow(t)
-	log := runInstallerWithGPG(t, workflow, "0000000000000000000000000000000000000000", false)
+	log, succeeded := runInstallerWithGPG(t, workflow, "0000000000000000000000000000000000000000", trustedSigningKey, 0)
+	if succeeded {
+		t.Fatal("installer unexpectedly succeeded with an unpinned primary key")
+	}
 	if !strings.Contains(log, "gpg-import") || !strings.Contains(log, "gpg-list") {
 		t.Fatalf("key import and primary-key selection were not attempted: %s", log)
 	}
@@ -208,24 +215,39 @@ func TestVaultInstallerStopsBeforeVerifyWhenImportedPrimaryKeyIsWrong(t *testing
 	assertNoChecksumExtractionOrExecution(t, log)
 }
 
-func runInstallerWithGPG(t *testing.T, workflow map[string]interface{}, primaryFingerprint string, failVerify bool) string {
+func TestVaultInstallerRejectsSuccessfulSignatureFromUnexpectedSigningSubkey(t *testing.T) {
+	workflow := loadWorkflow(t)
+	log, succeeded := runInstallerWithGPG(t, workflow, trustedPrimaryKey, "0000000000000000000000000000000000000001", 0)
+	if succeeded {
+		t.Fatal("installer accepted a successful signature from an unexpected signing subkey")
+	}
+	if !strings.Contains(log, "verify-reached") {
+		t.Fatalf("signature verifier was not reached: %s", log)
+	}
+	assertNoChecksumExtractionOrExecution(t, log)
+}
+
+func TestVaultInstallerContinuesAfterExpectedSigningIdentity(t *testing.T) {
+	workflow := loadWorkflow(t)
+	log, succeeded := runInstallerWithGPG(t, workflow, trustedPrimaryKey, trustedSigningKey, 0)
+	if !succeeded {
+		t.Fatalf("installer did not advance after the expected signing identity: %s", log)
+	}
+	for _, command := range []string{"verify-reached", "archive-download", "sha256sum", "unzip"} {
+		if !strings.Contains(log, command) {
+			t.Fatalf("installer did not reach %s after expected signing identity: %s", command, log)
+		}
+	}
+}
+
+func runInstallerWithGPG(t *testing.T, workflow map[string]interface{}, primaryFingerprint, signingFingerprint string, verifyExit int) (string, bool) {
 	t.Helper()
 	script := installerScript(t, workflow)
 
 	bin := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "commands.log")
 	writeStub(t, bin, "dpkg", "echo amd64")
-	writeStub(t, bin, "curl", `
-for ((index = 1; index <= $#; index++)); do
-  if [[ "${!index}" == "--output" ]]; then
-    next=$((index + 1))
-    : > "${!next}"
-  fi
-done`)
-	verifyExit := "0"
-	if failVerify {
-		verifyExit = "1"
-	}
+	writeStub(t, bin, "gpgconf", "exit 0")
 	writeStub(t, bin, "gpg", fmt.Sprintf(`
 case " $* " in
   *" --import "*) echo gpg-import >> "$TEST_COMMAND_LOG" ;;
@@ -235,26 +257,42 @@ case " $* " in
     ;;
   *" --verify "*)
     echo verify-reached >> "$TEST_COMMAND_LOG"
-    exit %s
+    printf '[GNUPG:] VALIDSIG %s 0 0 0 4 0 0 0 0 %s\n'
+    exit %d
     ;;
   *) exit 1 ;;
-esac`, primaryFingerprint, verifyExit))
+esac`, primaryFingerprint, signingFingerprint, trustedPrimaryKey, verifyExit))
+	writeStub(t, bin, "curl", `
+for ((index = 1; index <= $#; index++)); do
+  if [[ "${!index}" == "--output" ]]; then
+    next=$((index + 1))
+    output="${!next}"
+    case "$output" in
+      *SHA256SUMS)
+        printf '%064d  vault_2.2.1_linux_amd64.zip\n' 0 > "$output"
+        ;;
+      *vault_2.2.1_linux_amd64.zip)
+        echo archive-download >> "$TEST_COMMAND_LOG"
+        : > "$output"
+        ;;
+      *) : > "$output" ;;
+    esac
+  fi
+done`)
 	writeStub(t, bin, "sha256sum", "echo sha256sum >> \"$TEST_COMMAND_LOG\"")
 	writeStub(t, bin, "unzip", "echo unzip >> \"$TEST_COMMAND_LOG\"")
 	writeStub(t, bin, "make", "echo execution >> \"$TEST_COMMAND_LOG\"")
 
 	command := exec.Command("bash", "-c", script)
 	command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "RUNNER_TEMP="+t.TempDir(), "TEST_COMMAND_LOG="+logPath)
-	if output, err := command.CombinedOutput(); err == nil {
-		t.Fatalf("installer unexpectedly succeeded: %s", output)
-	}
+	_, err := command.CombinedOutput()
 	contents, _ := os.ReadFile(logPath)
-	return string(contents)
+	return string(contents), err == nil
 }
 
 func assertNoChecksumExtractionOrExecution(t *testing.T, log string) {
 	t.Helper()
-	if strings.Contains(log, "sha256sum") || strings.Contains(log, "unzip") || strings.Contains(log, "execution") {
+	if strings.Contains(log, "archive-download") || strings.Contains(log, "sha256sum") || strings.Contains(log, "unzip") || strings.Contains(log, "execution") {
 		t.Fatalf("installer continued after authentication failure: %s", log)
 	}
 }
