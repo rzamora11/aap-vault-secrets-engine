@@ -135,8 +135,26 @@ func TestRealVaultCleansKnownIDAfterMalformedSuccessfulIssue(t *testing.T) {
 		return fmt.Sprintf(`{"id":%d,"token":`, id)
 	}
 	vault := newVaultHarness(t, fixture)
-	if _, err := vault.client.Logical().Read("aap/creds/malformed"); err == nil {
+	if _, err := vault.client.Logical().Write("aap/roles/malformed", map[string]interface{}{"scope": "write", "ttl": "5m", "max_ttl": "5m", "description_prefix": "vault-aap"}); err != nil {
+		t.Fatalf("write malformed-response role: %v", err)
+	}
+	secret, err := vault.client.Logical().Read("aap/creds/malformed")
+	if err == nil {
 		t.Fatal("malformed successful upstream issue response produced a Vault credential")
+	}
+	if secret != nil {
+		t.Fatal("malformed successful upstream issue response returned a Vault credential")
+	}
+	fixture.mu.Lock()
+	posts := 0
+	for _, request := range fixture.requests {
+		if request.method == "POST" && request.path == "/api/gateway/v1/tokens/" && request.scope == "write" {
+			posts++
+		}
+	}
+	fixture.mu.Unlock()
+	if posts == 0 {
+		t.Fatal("malformed issue did not send an upstream token-creation request")
 	}
 	if got := fixture.deleteCount(42); got != 1 {
 		t.Fatalf("malformed response with known token ID sent %d cleanup deletes, want 1", got)
