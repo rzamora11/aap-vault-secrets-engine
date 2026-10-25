@@ -1,3 +1,13 @@
+/**
+ * @spec-handoff
+ * @interface Backend.HandleRequest(context.Context, *logical.Request): (*logical.Response, error)
+ * @behavior
+ *   - Issues and revokes gateway credentials with a nonrenewable bounded lease.
+ *   - Treats a missing upstream credential as an idempotently revoked lease.
+ * @edge-cases
+ *   - A deleted role does not prevent revocation of an already-issued lease.
+ * @see ./token.go
+ */
 package aap
 
 import (
@@ -166,7 +176,7 @@ func TestRoleDefaultsToOneHour(t *testing.T) {
 func TestRevokeTreatsMissingAAPTokenAsSuccess(t *testing.T) {
 	ctx := context.Background()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete || r.URL.Path != gatewayTokensPath+"gone/" {
+		if r.Method != http.MethodDelete || r.URL.Path != gatewayTokensPath+"42/" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -175,7 +185,7 @@ func TestRevokeTreatsMissingAAPTokenAsSuccess(t *testing.T) {
 
 	backend, storage := testBackend(t)
 	writeConfig(t, backend, storage, server.URL)
-	secret := backend.aapToken().Response(nil, map[string]interface{}{"token_id": "gone"}).Secret
+	secret := backend.aapToken().Response(nil, map[string]interface{}{"token_id": "42"}).Secret
 	_, err := backend.HandleRequest(ctx, &logical.Request{
 		Operation: logical.RevokeOperation,
 		Storage:   storage,
