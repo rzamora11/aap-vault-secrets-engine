@@ -132,6 +132,8 @@ jobs:
           [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
       - name: Publish release archives
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           distribution: goreleaser
           version: v2.19.0
