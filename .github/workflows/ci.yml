@@ -5,26 +5,140 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Test and build
+  quality:
+    name: Quality checks
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Check formatting
-        run: test -z "$(gofmt -l ./cmd ./aap)"
-      - name: Run tests
-        run: go test ./...
-      - name: Run vet
-        run: go vet ./...
+      - name: Verify module dependencies
+        run: make mod-verify tidy-check
+      - name: Check formatting, test, race, and vet
+        run: make fmt-check unit race vet
       - name: Build plugin
-        run: go build -o bin/vault-plugin-secrets-aap ./cmd/vault-plugin-secrets-aap
+        run: make build
+      - name: Check known vulnerabilities
+        run: make vulncheck
+
+  integration:
+    name: vault_lifecycle integration (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Download and verify Vault 2.2.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_primary_key="C874011F0AB405110D02105534365D9472D7468F"
+          trusted_signing_key="374EC75B485913604A831CC7C820C6D5CD27AB87"
+          case "$(dpkg --print-architecture)" in
+            amd64) vault_arch=amd64 ;;
+            arm64) vault_arch=arm64 ;;
+            *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;;
+          esac
+          archive="vault_2.2.1_linux_${vault_arch}.zip"
+          base_url="https://releases.hashicorp.com/vault/2.2.1"
+          verify_dir="$RUNNER_TEMP/vault-verify"
+          archive_dir="$RUNNER_TEMP/vault"
+          export GNUPGHOME="$verify_dir/keyring"
+          mkdir -p "$GNUPGHOME" "$archive_dir"
+          chmod 700 "$GNUPGHOME"
+          trap 'gpgconf --homedir "$GNUPGHOME" --kill all || true; rm -rf "$verify_dir"' EXIT
+
+          curl --fail --location --silent --show-error --output "$verify_dir/hashicorp-pgp-key.txt" "https://www.hashicorp.com/.well-known/pgp-key.txt"
+          curl --fail --location --silent --show-error --output "$verify_dir/vault_2.2.1_SHA256SUMS" "$base_url/vault_2.2.1_SHA256SUMS"
+          curl --fail --location --silent --show-error --output "$verify_dir/vault_2.2.1_SHA256SUMS.sig" "$base_url/vault_2.2.1_SHA256SUMS.sig"
+          gpg --batch --no-options --no-auto-key-retrieve --import "$verify_dir/hashicorp-pgp-key.txt"
+          primary_fingerprints="$(gpg --batch --no-options --with-colons --fingerprint --list-keys | awk -F: '$1 == "pub" { expect_fingerprint = 1; next } expect_fingerprint && $1 == "fpr" { print $10; expect_fingerprint = 0 }')"
+          [[ "$primary_fingerprints" == "$trusted_primary_key" ]]
+          valid_signature="$(gpg --batch --no-options --no-auto-key-retrieve --status-fd=1 --verify "$verify_dir/vault_2.2.1_SHA256SUMS.sig" "$verify_dir/vault_2.2.1_SHA256SUMS" 2>/dev/null | awk '$2 == "VALIDSIG" { print $3, $12 }')"
+          [[ "$valid_signature" == "$trusted_signing_key $trusted_primary_key" ]]
+
+          expected_checksum="$(awk -v archive="$archive" '$2 == archive { print $1 }' "$verify_dir/vault_2.2.1_SHA256SUMS")"
+          [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]]
+          curl --fail --location --silent --show-error --output "$archive_dir/$archive" "$base_url/$archive"
+          (cd "$archive_dir" && printf '%s  %s\n' "$expected_checksum" "$archive" | sha256sum --check --status -)
+          unzip -q "$archive_dir/$archive" -d "$archive_dir/bin"
+      - name: Run real Vault lifecycle integration
+        env:
+          VAULT_BINARY: ${{ runner.temp }}/vault/bin/vault
+        run: make integration
+
+  release-snapshot:
+    if: github.ref_type != 'tag'
+    name: GoReleaser snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build release archives without publishing
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.19.0
+          args: release --snapshot --clean
+
+  release:
+    if: github.event_name == 'push' && github.repository == 'rzamora11/aap-vault-secrets-engine' && startsWith(github.ref, 'refs/tags/v')
+    name: Publish tagged release
+    needs: [quality, integration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Verify vX.Y.Z release tag
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Publish release archives
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          distribution: goreleaser
+          version: v2.19.0
+          args: release --clean
+      - name: Attest release checksums
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt

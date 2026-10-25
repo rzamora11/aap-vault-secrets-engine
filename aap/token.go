@@ -66,19 +66,21 @@ func (b *Backend) pathCredentialsRead(ctx context.Context, req *logical.Request,
 	if err != nil {
 		return nil, err
 	}
+	defer client.close()
 	description, err := tokenDescription(role.DescriptionPrefix, roleName)
 	if err != nil {
 		return nil, err
 	}
 	token, err := client.issueToken(ctx, role.Scope, description)
 	if err != nil {
+		if token != nil {
+			_ = client.revokeToken(ctx, token.ID)
+		}
 		return nil, err
 	}
 
 	remainingAAPLifetime := time.Until(token.ExpiresAt) - expirySafetyMargin
 	if remainingAAPLifetime <= 0 {
-		// Avoid returning a credential that is already expired. Best-effort cleanup is
-		// deliberately attempted before reporting the unsafe upstream response.
 		_ = client.revokeToken(ctx, token.ID)
 		return nil, fmt.Errorf("AAP returned a token expiring too soon to issue safely")
 	}
@@ -114,6 +116,7 @@ func (b *Backend) tokenRevoke(ctx context.Context, req *logical.Request, _ *fram
 	if err != nil {
 		return nil, err
 	}
+	defer client.close()
 	if err := client.revokeToken(ctx, tokenID); err != nil {
 		return nil, err
 	}

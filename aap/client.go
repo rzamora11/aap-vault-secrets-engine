@@ -10,11 +10,20 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
 
-const gatewayTokensPath = "/api/gateway/v1/tokens/"
+const (
+	gatewayTokensPath      = "/api/gateway/v1/tokens/"
+	maxGatewayResponseSize = 1 << 20
+)
+
+var (
+	tokenIDPattern       = regexp.MustCompile(`^[1-9][0-9]*$`)
+	recoverableIDPattern = regexp.MustCompile(`^\s*\{\s*"id"\s*:\s*([1-9][0-9]*)\s*,`)
+)
 
 type aapClient struct {
 	baseURL     string
@@ -29,15 +38,9 @@ type issuedToken struct {
 }
 
 func newAAPClient(config *config) (*aapClient, error) {
-	parsedURL, err := url.Parse(config.URL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return nil, fmt.Errorf("invalid AAP URL %q", config.URL)
-	}
-	if parsedURL.Scheme != "https" && parsedURL.Scheme != "http" {
-		return nil, fmt.Errorf("AAP URL must use http or https")
-	}
-	if parsedURL.Scheme == "http" && !config.AllowInsecureHTTP {
-		return nil, fmt.Errorf("AAP URL uses insecure HTTP; set allow_insecure_http only for a test environment")
+	baseURL, err := validateGateway(config.URL, config.AllowInsecureHTTP)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(config.IssuerToken) == "" {
 		return nil, fmt.Errorf("AAP issuer token is empty")
@@ -53,7 +56,7 @@ func newAAPClient(config *config) (*aapClient, error) {
 	}
 
 	return &aapClient{
-		baseURL:     strings.TrimRight(config.URL, "/"),
+		baseURL:     baseURL,
 		issuerToken: config.IssuerToken,
 		http: &http.Client{
 			Timeout: 15 * time.Second,
@@ -65,6 +68,26 @@ func newAAPClient(config *config) (*aapClient, error) {
 			},
 		},
 	}, nil
+}
+
+func validateGateway(rawURL string, allowInsecureHTTP bool) (string, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" || parsedURL.Opaque != "" {
+		return "", fmt.Errorf("invalid AAP gateway URL")
+	}
+	if parsedURL.User != nil || parsedURL.RawQuery != "" || parsedURL.Fragment != "" || parsedURL.RawFragment != "" {
+		return "", fmt.Errorf("AAP gateway URL must be an origin")
+	}
+	if parsedURL.Path != "" && parsedURL.Path != "/" || parsedURL.RawPath != "" {
+		return "", fmt.Errorf("AAP gateway URL must not include a path")
+	}
+	if parsedURL.Scheme != "https" && parsedURL.Scheme != "http" {
+		return "", fmt.Errorf("AAP gateway URL must use HTTP or HTTPS")
+	}
+	if parsedURL.Scheme == "http" && !allowInsecureHTTP {
+		return "", fmt.Errorf("AAP gateway URL requires HTTPS unless allow_insecure_http is enabled")
+	}
+	return parsedURL.Scheme + "://" + parsedURL.Host, nil
 }
 
 func (c *aapClient) issueToken(ctx context.Context, scope, description string) (*issuedToken, error) {
@@ -88,30 +111,51 @@ func (c *aapClient) issueToken(ctx context.Context, scope, description string) (
 	}
 	defer response.Body.Close()
 
-	var payload struct {
-		ID      json.Number `json:"id"`
-		Token   string      `json:"token"`
-		Expires string      `json:"expires"`
+	payload, err := decodeIssuedToken(response.Body)
+	if err != nil {
+		return payload, err
 	}
-	decoder := json.NewDecoder(response.Body)
+	return payload, nil
+}
+
+func decodeIssuedToken(body io.Reader) (*issuedToken, error) {
+	contents, err := io.ReadAll(io.LimitReader(body, maxGatewayResponseSize+1))
+	if err != nil || len(contents) > maxGatewayResponseSize {
+		return recoverableTokenID(contents), fmt.Errorf("AAP token response is invalid")
+	}
+	var payload struct {
+		ID      json.RawMessage `json:"id"`
+		Token   string          `json:"token"`
+		Expires string          `json:"expires"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(contents))
 	decoder.UseNumber()
 	if err := decoder.Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode AAP token response: %w", err)
+		return recoverableTokenID(contents), fmt.Errorf("AAP token response is invalid")
 	}
-	if payload.ID == "" || payload.Token == "" || payload.Expires == "" {
-		return nil, fmt.Errorf("AAP token response omitted id, token, or expires")
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return recoverableTokenID(contents), fmt.Errorf("AAP token response is invalid")
+	}
+	tokenID := string(payload.ID)
+	if !validTokenID(tokenID) {
+		return nil, fmt.Errorf("AAP token response has an invalid id")
+	}
+	token := &issuedToken{ID: tokenID, Token: payload.Token}
+	if payload.Token == "" || payload.Expires == "" {
+		return token, fmt.Errorf("AAP token response omitted token or expires")
 	}
 	expiresAt, err := time.Parse(time.RFC3339Nano, payload.Expires)
 	if err != nil {
-		return nil, fmt.Errorf("parse AAP token expiry: %w", err)
+		return token, fmt.Errorf("AAP token response has an invalid expiry")
 	}
-
-	return &issuedToken{ID: payload.ID.String(), Token: payload.Token, ExpiresAt: expiresAt}, nil
+	token.ExpiresAt = expiresAt
+	return token, nil
 }
 
 func (c *aapClient) revokeToken(ctx context.Context, tokenID string) error {
-	if tokenID == "" {
-		return fmt.Errorf("AAP token id is empty")
+	if !validTokenID(tokenID) {
+		return fmt.Errorf("AAP token id is invalid")
 	}
 	req, err := c.newRequest(ctx, http.MethodDelete, gatewayTokensPath+url.PathEscape(tokenID)+"/", nil)
 	if err != nil {
@@ -119,7 +163,7 @@ func (c *aapClient) revokeToken(ctx context.Context, tokenID string) error {
 	}
 	response, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("call AAP token revoke endpoint: %w", err)
+		return fmt.Errorf("AAP token revoke request failed")
 	}
 	defer response.Body.Close()
 	if response.StatusCode == http.StatusNotFound {
@@ -143,7 +187,7 @@ func (c *aapClient) newRequest(ctx context.Context, method, path string, body io
 func (c *aapClient) do(req *http.Request, successCodes ...int) (*http.Response, error) {
 	response, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("call AAP token endpoint: %w", err)
+		return nil, fmt.Errorf("AAP token request failed")
 	}
 	for _, statusCode := range successCodes {
 		if response.StatusCode == statusCode {
@@ -155,10 +199,21 @@ func (c *aapClient) do(req *http.Request, successCodes ...int) (*http.Response, 
 }
 
 func responseError(response *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-	message := strings.TrimSpace(string(body))
-	if message == "" {
-		message = response.Status
+	return fmt.Errorf("AAP API returned status %d", response.StatusCode)
+}
+
+func validTokenID(tokenID string) bool {
+	return tokenIDPattern.MatchString(tokenID)
+}
+
+func recoverableTokenID(contents []byte) *issuedToken {
+	matches := recoverableIDPattern.FindSubmatch(contents)
+	if len(matches) != 2 {
+		return nil
 	}
-	return fmt.Errorf("AAP API returned %s: %s", response.Status, message)
+	return &issuedToken{ID: string(matches[1])}
+}
+
+func (c *aapClient) close() {
+	c.http.CloseIdleConnections()
 }
