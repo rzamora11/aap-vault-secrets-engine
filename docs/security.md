@@ -8,7 +8,7 @@ One mount has one issuer identity. Roles set token scope and lease duration, but
 
 - Gateway URLs are restricted to an HTTP or HTTPS origin with no path, query, fragment, or userinfo.
 - HTTPS certificate verification is enabled by default. Use `ca_cert` for a private CA. `tls_skip_verify` and `allow_insecure_http` are explicit test-environment opt-ins.
-- Vault seal-wraps stored configuration and roles through the backend's configured seal-wrap paths.
+- Vault barrier encryption protects data stored by Vault. Separately, the backend's `SealWrapStorage` declaration requests [seal wrapping](https://developer.hashicorp.com/vault/docs/enterprise/sealwrap) for its supported storage paths when the deployment has the required Enterprise entitlement, a supporting seal, and seal wrapping enabled in the deployment configuration. A Community Vault deployment does not receive an additional seal-wrapping guarantee from this backend.
 - Configuration reads redact the issuer token and custom CA.
 - The plugin does not return raw AAP gateway error bodies.
 

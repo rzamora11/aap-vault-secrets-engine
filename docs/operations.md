@@ -4,7 +4,7 @@
 
 **Drain active leases before any gateway endpoint, issuer identity, TLS certificate, CA, or configuration replacement or deletion.** This is an operational requirement documented here; the plugin does not enforce it.
 
-Active leases need the current configuration to revoke their upstream AAP tokens. Deleting or replacing configuration while leases remain can make revocation fail. Issuer token rotation under the same identity must not be assumed to retain cleanup authority: verify that the replacement token can delete tokens created by the previous token before changing Vault configuration.
+Active leases need the current configuration to revoke their upstream AAP tokens. Deleting or replacing configuration while leases remain can make revocation fail. Issuer token rotation under the same identity must not be assumed to retain cleanup authority: verify that the replacement token can delete tokens created by the previous token before changing Vault configuration. Follow the [rotation runbook](#rotation-runbook) for any configuration change that affects issuance or revocation.
 
 Run these read-only checks first:
 
@@ -15,18 +15,18 @@ vault list aap/roles
 vault read aap/config
 ```
 
-Inventory active Vault leases for the mount using your approved Vault operator procedure. Do not paste credential-read output into that inventory. Revoke or let every active lease expire, then verify that no active lease still requires the current AAP connection.
-
-Only after the drain is confirmed should an operator change the issuer, gateway, TLS settings, custom CA, or delete `aap/config`. Record the drain result and the authority check in the change record.
+Do not treat an empty Vault lease inventory as proof that AAP has no token from an earlier request with an unknown outcome. Investigate those possible orphaned tokens in AAP records as described in [Incident response](#incident-response).
 
 ## Rotation runbook
 
-1. Confirm the replacement issuer identity has only the intended AAP permissions.
-2. Confirm it can revoke a non-production token created under the current identity, where the AAP authorization model permits that test.
-3. Drain active Vault leases.
-4. Update the configuration through the approved secret-input procedure described in [Configuration](configuration.md).
-5. Issue one controlled credential and revoke its Vault lease. Confirm the upstream token is removed.
-6. Restore normal credential reads only after the controlled revoke succeeds.
+1. Freeze new credential reads at the workload access boundary. Preserve the mount, its current configuration, and the current issuer identity and its ability to revoke existing tokens. This is an operator procedure, not a plugin-enforced guard.
+2. Wait for every in-flight credential issuance request to complete. Investigate any request with an unknown outcome as a possible orphaned AAP token. Do not use elapsed time as evidence that requests have finished.
+3. Confirm the replacement issuer identity has only the intended AAP permissions and can revoke a non-production token created under the current identity, where the AAP authorization model permits that test.
+4. Recursively inventory existing Vault leases for the mount using the approved Vault operator procedure. Do not paste credential-read output into that inventory.
+5. Revoke or let every inventoried lease expire, then verify the inventory is empty. Recheck the recursive inventory before continuing.
+6. Only after the recheck is empty, update the gateway, issuer, TLS settings, custom CA, or configuration through the approved secret-input procedure described in [Configuration](configuration.md). Do not force-revoke leases, bypass revocation, disable the mount, or remove the old authority while it is needed to clean up existing tokens.
+7. Issue one controlled credential and revoke its Vault lease. Confirm the upstream token is removed.
+8. Resume normal credential reads only after the controlled revoke succeeds.
 
 Do not remove the old issuer identity until the drain and controlled revoke complete.
 
