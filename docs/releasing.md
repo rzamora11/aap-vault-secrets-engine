@@ -1,6 +1,6 @@
 # Releasing
 
-Releases are not published yet. The next planned tag is `v0.2.0`, but it has not been created, reserved, or published. For each release, merge the intended changes into `main` and pass the required checks, then a maintainer manually creates and pushes a semantic tag in the form `vX.Y.Z` from that merged commit. GoReleaser derives the release version from the tag; this project does not calculate a version from commit messages or create release pull requests.
+Releases are not published yet. The next planned tag is `v0.2.0`, but it has not been created, reserved, or published. For each release, merge the intended changes into `main` and pass the required checks, then a maintainer manually creates and pushes a semantic tag in the form `vX.Y.Z` from that merged commit. GoReleaser derives the release version from the tag; this project does not calculate a version from commit messages.
 
 The tagged-release job runs only for `rzamora11/aap-vault-secrets-engine` and validates the tag format. Tag CI runs the quality checks and native Linux `amd64` and `arm64` integration jobs before GoReleaser 2.19.0 publishes Linux `amd64` and `arm64` tarballs containing the plugin binary and `LICENSE`, plus `checksums.txt`.
 
