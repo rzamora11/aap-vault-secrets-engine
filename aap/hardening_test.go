@@ -385,6 +385,64 @@ func TestCredentialLeaseTTLUsesSmallestConfiguredAndUpstreamLimit(t *testing.T) 
 	}
 }
 
+func TestCredentialRequestWithoutConfigurationFailsBeforeGatewayRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	backend, storage := testBackend(t)
+	writeRole(t, backend, storage, "operator", time.Hour, time.Hour)
+	response, err := backend.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/operator",
+		Storage:   storage,
+	})
+	if err == nil || response != nil {
+		t.Fatalf("unconfigured backend returned credential response=%#v err=%v", response, err)
+	}
+	if !strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("unconfigured backend returned an unsafe error category: %v", err)
+	}
+	if strings.Contains(err.Error(), "issuer-token") {
+		t.Fatalf("unconfigured backend leaked credential material: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("unconfigured backend sent %d upstream requests, want 0", got)
+	}
+}
+
+func TestCredentialRequestWithoutRoleFailsBeforeGatewayRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	backend, storage := testBackend(t)
+	writeConfig(t, backend, storage, server.URL)
+	response, err := backend.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/missing",
+		Storage:   storage,
+	})
+	if err == nil || response != nil {
+		t.Fatalf("missing role returned credential response=%#v err=%v", response, err)
+	}
+	if !strings.Contains(err.Error(), `role "missing" does not exist`) {
+		t.Fatalf("missing role returned an unsafe error category: %v", err)
+	}
+	if strings.Contains(err.Error(), "issuer-token") {
+		t.Fatalf("missing role leaked credential material: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("missing role sent %d upstream requests, want 0", got)
+	}
+}
+
 func TestRoleDeletionDoesNotPreventIssuedLeaseRevocation(t *testing.T) {
 	var deletes atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
