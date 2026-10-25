@@ -7,7 +7,7 @@ import (
 	"github.com/hashicorp/vault/api"
 	"github.com/hashicorp/vault/sdk/plugin"
 
-	aap "github.com/roman-zamora/aap-vault-secrets-engine/aap"
+	aap "github.com/rzamora11/aap-vault-secrets-engine/aap"
 )
 
 func main() {

@@ -3,7 +3,6 @@ package aap
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -71,7 +70,10 @@ func (b *Backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 }
 
 func (b *Backend) pathConfigWrite(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	url := strings.TrimRight(data.Get("url").(string), "/")
+	url, err := validateGateway(data.Get("url").(string), data.Get("allow_insecure_http").(bool))
+	if err != nil {
+		return nil, fmt.Errorf("invalid AAP configuration: %w", err)
+	}
 	if _, err := newAAPClient(&config{
 		URL:               url,
 		IssuerToken:       data.Get("issuer_token").(string),
