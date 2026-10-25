@@ -359,6 +359,142 @@ func TestCredentialIssuePreservesPrimaryErrorWhenCleanupFails(t *testing.T) {
 	}
 }
 
+func TestCredentialIssueCleansUpRecoverableTokenWhenGatewayBodyCannotBeReadOrIsOversized(t *testing.T) {
+	testCases := []struct {
+		name  string
+		write func(http.ResponseWriter)
+	}{
+		{
+			name: "truncated response",
+			write: func(w http.ResponseWriter) {
+				body := `{"id":42,"token":"gateway-token-secret"`
+				w.Header().Set("Content-Length", fmt.Sprint(len(body)+1))
+				_, _ = w.Write([]byte(body))
+			},
+		},
+		{
+			name: "oversized response",
+			write: func(w http.ResponseWriter) {
+				_, _ = w.Write([]byte(`{"id":42,"token":"gateway-token-secret","expires":"2030-01-01T00:00:00Z","padding":"` + strings.Repeat("x", maxGatewayResponseSize) + `"}`))
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var posts, deletes atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == gatewayTokensPath:
+					posts.Add(1)
+					testCase.write(w)
+				case r.Method == http.MethodDelete && r.URL.Path == gatewayTokensPath+"42/":
+					deletes.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			backend, storage := testBackend(t)
+			writeConfig(t, backend, storage, server.URL)
+			writeRole(t, backend, storage, "cleanup-read-failure", time.Hour, time.Hour)
+			response, err := backend.HandleRequest(context.Background(), &logical.Request{
+				Operation: logical.ReadOperation,
+				Path:      "creds/cleanup-read-failure",
+				Storage:   storage,
+			})
+			if err == nil || response != nil {
+				t.Fatalf("invalid gateway response issued a lease: response=%#v err=%v", response, err)
+			}
+			if strings.Contains(err.Error(), "gateway-token-secret") {
+				t.Fatalf("credential issue error leaked response body: %v", err)
+			}
+			if got := posts.Load(); got != 1 {
+				t.Fatalf("credential issue made %d POST requests, want 1", got)
+			}
+			if got := deletes.Load(); got != 1 {
+				t.Fatalf("recoverable token issued %d cleanup deletes, want 1", got)
+			}
+		})
+	}
+}
+
+func TestCredentialIssueDoesNotCleanUpUnknownInvalidTokenID(t *testing.T) {
+	var deletes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == gatewayTokensPath:
+			_, _ = w.Write([]byte(`{"id":0,"token":"gateway-token-secret"`))
+		case r.Method == http.MethodDelete:
+			deletes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	backend, storage := testBackend(t)
+	writeConfig(t, backend, storage, server.URL)
+	writeRole(t, backend, storage, "invalid-id", time.Hour, time.Hour)
+	_, err := backend.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/invalid-id",
+		Storage:   storage,
+	})
+	if err == nil {
+		t.Fatal("invalid token ID response issued a lease")
+	}
+	if strings.Contains(err.Error(), "gateway-token-secret") {
+		t.Fatalf("credential issue error leaked response body: %v", err)
+	}
+	if got := deletes.Load(); got != 0 {
+		t.Fatalf("unknown invalid token ID triggered %d cleanup deletes, want 0", got)
+	}
+}
+
+func TestCredentialIssuePreservesReadFailureWhenRecoverableCleanupFails(t *testing.T) {
+	var deletes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == gatewayTokensPath:
+			body := `{"id":42,"token":"gateway-token-secret"`
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)+1))
+			_, _ = w.Write([]byte(body))
+		case r.Method == http.MethodDelete && r.URL.Path == gatewayTokensPath+"42/":
+			deletes.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("cleanup-gateway-token-secret"))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	backend, storage := testBackend(t)
+	writeConfig(t, backend, storage, server.URL)
+	writeRole(t, backend, storage, "cleanup-read-failure", time.Hour, time.Hour)
+	_, err := backend.HandleRequest(context.Background(), &logical.Request{
+		Operation: logical.ReadOperation,
+		Path:      "creds/cleanup-read-failure",
+		Storage:   storage,
+	})
+	if err == nil {
+		t.Fatal("truncated gateway response issued a lease")
+	}
+	if !strings.Contains(err.Error(), "token response") {
+		t.Fatalf("cleanup failure replaced the primary response error: %v", err)
+	}
+	if strings.Contains(err.Error(), "gateway-token-secret") || strings.Contains(err.Error(), "cleanup-gateway-token-secret") {
+		t.Fatalf("credential issue error leaked response or cleanup body: %v", err)
+	}
+	if got := deletes.Load(); got != 1 {
+		t.Fatalf("recoverable token issued %d cleanup deletes, want 1", got)
+	}
+}
+
 func TestCredentialLeaseTTLUsesSmallestConfiguredAndUpstreamLimit(t *testing.T) {
 	expires := time.Now().Add(90 * time.Minute)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
