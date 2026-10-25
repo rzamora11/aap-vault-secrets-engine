@@ -121,7 +121,7 @@ func (c *aapClient) issueToken(ctx context.Context, scope, description string) (
 func decodeIssuedToken(body io.Reader) (*issuedToken, error) {
 	contents, err := io.ReadAll(io.LimitReader(body, maxGatewayResponseSize+1))
 	if err != nil || len(contents) > maxGatewayResponseSize {
-		return nil, fmt.Errorf("AAP token response is invalid")
+		return recoverableTokenID(contents), fmt.Errorf("AAP token response is invalid")
 	}
 	var payload struct {
 		ID      json.RawMessage `json:"id"`

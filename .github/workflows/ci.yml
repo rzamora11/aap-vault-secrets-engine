@@ -53,6 +53,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          trusted_primary_key="C874011F0AB405110D02105534365D9472D7468F"
+          trusted_signing_key="374EC75B485913604A831CC7C820C6D5CD27AB87"
           case "$(dpkg --print-architecture)" in
             amd64) vault_arch=amd64 ;;
             arm64) vault_arch=arm64 ;;
@@ -60,11 +62,27 @@ jobs:
           esac
           archive="vault_2.2.1_linux_${vault_arch}.zip"
           base_url="https://releases.hashicorp.com/vault/2.2.1"
-          mkdir -p "$RUNNER_TEMP/vault"
-          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/vault/$archive" "$base_url/$archive"
-          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/vault/vault_2.2.1_SHA256SUMS" "$base_url/vault_2.2.1_SHA256SUMS"
-          (cd "$RUNNER_TEMP/vault" && grep " $archive$" vault_2.2.1_SHA256SUMS | sha256sum --check --status -)
-          unzip -q "$RUNNER_TEMP/vault/$archive" -d "$RUNNER_TEMP/vault/bin"
+          verify_dir="$RUNNER_TEMP/vault-verify"
+          archive_dir="$RUNNER_TEMP/vault"
+          export GNUPGHOME="$verify_dir/keyring"
+          mkdir -p "$GNUPGHOME" "$archive_dir"
+          chmod 700 "$GNUPGHOME"
+          trap 'gpgconf --homedir "$GNUPGHOME" --kill all || true; rm -rf "$verify_dir"' EXIT
+
+          curl --fail --location --silent --show-error --output "$verify_dir/hashicorp-pgp-key.txt" "https://www.hashicorp.com/.well-known/pgp-key.txt"
+          curl --fail --location --silent --show-error --output "$verify_dir/vault_2.2.1_SHA256SUMS" "$base_url/vault_2.2.1_SHA256SUMS"
+          curl --fail --location --silent --show-error --output "$verify_dir/vault_2.2.1_SHA256SUMS.sig" "$base_url/vault_2.2.1_SHA256SUMS.sig"
+          gpg --batch --no-options --no-auto-key-retrieve --import "$verify_dir/hashicorp-pgp-key.txt"
+          primary_fingerprints="$(gpg --batch --no-options --with-colons --fingerprint --list-keys | awk -F: '$1 == "pub" { expect_fingerprint = 1; next } expect_fingerprint && $1 == "fpr" { print $10; expect_fingerprint = 0 }')"
+          [[ "$primary_fingerprints" == "$trusted_primary_key" ]]
+          valid_signature="$(gpg --batch --no-options --no-auto-key-retrieve --status-fd=1 --verify "$verify_dir/vault_2.2.1_SHA256SUMS.sig" "$verify_dir/vault_2.2.1_SHA256SUMS" 2>/dev/null | awk '$2 == "VALIDSIG" { print $3, $12 }')"
+          [[ "$valid_signature" == "$trusted_signing_key $trusted_primary_key" ]]
+
+          expected_checksum="$(awk -v archive="$archive" '$2 == archive { print $1 }' "$verify_dir/vault_2.2.1_SHA256SUMS")"
+          [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]]
+          curl --fail --location --silent --show-error --output "$archive_dir/$archive" "$base_url/$archive"
+          (cd "$archive_dir" && printf '%s  %s\n' "$expected_checksum" "$archive" | sha256sum --check --status -)
+          unzip -q "$archive_dir/$archive" -d "$archive_dir/bin"
       - name: Run real Vault lifecycle integration
         env:
           VAULT_BINARY: ${{ runner.temp }}/vault/bin/vault
@@ -93,6 +111,7 @@ jobs:
   release:
     if: github.event_name == 'push' && github.repository == 'rzamora11/aap-vault-secrets-engine' && startsWith(github.ref, 'refs/tags/v')
     name: Publish tagged release
+    needs: [quality, integration]
     runs-on: ubuntu-latest
     permissions:
       contents: write
