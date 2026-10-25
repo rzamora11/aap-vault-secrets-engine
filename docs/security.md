@@ -16,6 +16,14 @@ One mount has one issuer identity. Roles set token scope and lease duration, but
 
 The result of `aap/creds/<role>` includes a bearer token. Do not send the output to logs, ticket attachments, CI output, Terraform state, or plan files. Limit Vault policies to the exact credential path a workload needs.
 
+## Dependency advisory residual risk
+
+The official [GO-2026-5932 advisory](https://vuln.go.dev/ID/GO-2026-5932.json), published 2026-07-07, covers the legacy `golang.org/x/crypto/openpgp` package in all versions and lists no fixed version. The current module graph includes `golang.org/x/crypto` 0.58.0, so the advisory remains present at the module level.
+
+With Go 1.27.3, `govulncheck` 1.9.0 found zero affected reachable calls across the repository's three root packages in its analyzed build configuration. This advisory is neither patched nor suppressed. The normal `make vulncheck` gate remains enabled and will fail if it finds a new reachable vulnerability in that configuration.
+
+Rodo accepted this residual risk for this pull request only. It is not a general endorsement of the dependency and does not guarantee security. Reassess it when the SDK or dependencies change, or when build tags, platforms, or other build configurations change. This focused work does not plan a dependency migration or fork.
+
 ## Vulnerability reports
 
 This repository does not publish a maintainer email address or other private reporting channel. Do not disclose a suspected vulnerability, exploit, or credential in a public issue. If GitHub Private Vulnerability Reporting is enabled for this repository, use the repository security advisory form. Otherwise, contact the repository owner through an already established private channel.
